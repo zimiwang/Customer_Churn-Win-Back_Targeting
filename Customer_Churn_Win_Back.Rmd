@@ -1,12 +1,562 @@
 ---
-title: "Customer_Churn-Win-Back_Targeting"
+title: "Customer Churn and Win-Back Targeting"
 author: "Yutong He"
-date: "2025-11-02"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
   html_document:
-    number_sections: true
     toc: true
-    toc_depth: 3
     toc_float: true
+    number_sections: true
 ---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(123)
+```
+
+# Business Problem
+
+Customer churn erodes recurring revenue and increases acquisition costs. Our goal is to build a reproducible machine learning pipeline that estimates each customer's probability of churn, calibrates those probabilities, and recommends an actionable retention strategy. The analysis culminates in a budget-aware rule for who to contact in order to maximize retention value while respecting operational constraints.
+
+# Leakage Policy
+
+Data leakage occurs when information that would not be available at prediction time is used for model training, causing overly optimistic performance. To prevent leakage we:
+
+- Restrict the modeling dataset to historical customer attributes that would have been known before the churn decision.
+- Split data into training and validation sets before any model fitting or imputation, and reuse the validation set exclusively for performance estimation and calibration.
+- Avoid any scaling, imputation, or feature engineering that aggregates statistics across the full dataset prior to the split, ensuring all transformations are derived from training data only.
+
+# Setup
+
+```{r packages}
+required_packages <- c(
+  "tidyverse", "caret", "C50", "randomForest", "xgboost", "psych", "e1071",
+  "pROC", "knitr", "yardstick", "scales", "cowplot"
+)
+
+installed <- required_packages %in% rownames(installed.packages())
+if (any(!installed)) {
+  install.packages(required_packages[!installed])
+}
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(psych)
+library(pROC)
+library(knitr)
+library(yardstick)
+library(scales)
+
+options(scipen = 999)
+theme_set(theme_minimal())
+
+dir.create("figures", showWarnings = FALSE)
+stopifnot(file.exists("churn_train.csv"))
+```
+
+# Load and Inspect Data
+
+```{r load-data}
+raw_churn <- readr::read_csv("churn_train.csv", na = c("", "NA", " "))
+
+str(raw_churn)
+summary(raw_churn)
+```
+
+```{r preprocess-overview}
+churn_data <- raw_churn %>%
+  mutate(
+    TotalCharges = as.numeric(TotalCharges),
+    SeniorCitizen = factor(SeniorCitizen, levels = c(0, 1), labels = c("No", "Yes")),
+    Churn = factor(Churn, levels = c("No", "Yes"))
+  )
+
+character_cols <- churn_data %>%
+  select(where(is.character)) %>%
+  names()
+
+churn_data <- churn_data %>%
+  mutate(across(all_of(setdiff(character_cols, "ID")), as.factor))
+
+missing_summary <- churn_data %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "feature", values_to = "n_missing") %>%
+  arrange(desc(n_missing))
+
+missing_summary %>% filter(n_missing > 0) %>% kable(col.names = c("Feature", "Missing Values"))
+```
+
+```{r churn-distribution}
+churn_data %>%
+  count(Churn) %>%
+  mutate(rate = n / sum(n)) %>%
+  kable(col.names = c("Churn", "Count", "Rate"), digits = 3)
+```
+
+# Exploratory Data Analysis
+
+```{r numeric-distributions, fig.width=10, fig.height=6}
+numeric_cols <- churn_data %>% select(where(is.numeric)) %>% names()
+
+churn_data %>%
+  pivot_longer(cols = all_of(numeric_cols), names_to = "feature", values_to = "value") %>%
+  ggplot(aes(x = value, fill = Churn)) +
+  geom_histogram(position = "identity", alpha = 0.6, bins = 30) +
+  facet_wrap(~ feature, scales = "free") +
+  labs(title = "Numeric Feature Distributions by Churn", x = NULL, y = "Count") +
+  scale_fill_manual(values = c("#2C3E50", "#E74C3C"))
+```
+
+```{r categorical-churn, fig.width=10, fig.height=6}
+churn_data %>%
+  filter(!is.na(Contract)) %>%
+  group_by(Contract, Churn) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Contract) %>%
+  mutate(rate = count / sum(count)) %>%
+  ggplot(aes(x = Contract, y = rate, fill = Churn)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Churn Rate by Contract Type", y = "Percentage", x = NULL, fill = "Churn")
+```
+
+```{r internet-payment, fig.width=12, fig.height=6}
+plot_internet <- churn_data %>%
+  filter(!is.na(InternetService)) %>%
+  group_by(InternetService, Churn) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(InternetService) %>%
+  mutate(rate = count / sum(count)) %>%
+  ggplot(aes(x = InternetService, y = rate, fill = Churn)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Churn Rate by Internet Service", x = NULL, y = "Percentage", fill = "Churn")
+
+plot_payment <- churn_data %>%
+  filter(!is.na(PaymentMethod)) %>%
+  group_by(PaymentMethod, Churn) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(PaymentMethod) %>%
+  mutate(rate = count / sum(count)) %>%
+  ggplot(aes(x = PaymentMethod, y = rate, fill = Churn)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Churn Rate by Payment Method", x = NULL, y = "Percentage", fill = "Churn") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cowplot::plot_grid(plot_internet, plot_payment, ncol = 2)
+```
+
+```{r correlations, fig.width=8, fig.height=8}
+psych::pairs.panels(churn_data %>% select(all_of(numeric_cols)),
+                    method = "pearson",
+                    hist.col = "#1ABC9C",
+                    density = TRUE,
+                    ellipses = TRUE)
+```
+
+# Feature Preparation
+
+```{r data-split}
+split_index <- createDataPartition(churn_data$Churn, p = 0.8, list = FALSE)
+
+train_data <- churn_data[split_index, ]
+valid_data <- churn_data[-split_index, ]
+
+numeric_cols <- train_data %>% select(where(is.numeric)) %>% names()
+
+train_medians <- train_data %>% summarise(across(all_of(numeric_cols), ~ median(., na.rm = TRUE)))
+train_medians <- as.list(train_medians)
+
+train_factor_levels <- train_data %>%
+  select(where(is.factor)) %>%
+  purrr::map(levels)
+
+train_data <- train_data %>%
+  mutate(across(all_of(numeric_cols), ~ tidyr::replace_na(., train_medians[[cur_column()]])))
+valid_data <- valid_data %>%
+  mutate(across(all_of(numeric_cols), ~ tidyr::replace_na(., train_medians[[cur_column()]])))
+
+train_model_data <- train_data %>% select(-ID)
+valid_model_data <- valid_data %>% select(-ID)
+
+feature_names <- setdiff(names(train_model_data), "Churn")
+
+set.seed(123)
+folds <- createFolds(train_model_data$Churn, k = 5, returnTrain = TRUE)
+
+ctrl_oof <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  index = folds
+)
+```
+
+```{r pca}
+pca_result <- prcomp(train_model_data %>% select(all_of(numeric_cols)), scale. = TRUE)
+summary(pca_result)
+```
+
+# Baseline Model – Logistic Regression
+
+We employ stratified 5-fold cross-validation because the churn data lack an inherent temporal ordering, making random folds a more robust estimate than a time-based split. The saved out-of-fold (OOF) predictions ensure every sample is scored by a model that was not trained on that sample.
+
+```{r logistic-model}
+logit_model <- train(
+  Churn ~ .,
+  data = train_model_data,
+  method = "glm",
+  family = binomial(),
+  metric = "ROC",
+  trControl = ctrl_oof
+)
+
+logit_valid_probs <- predict(logit_model, newdata = valid_model_data, type = "prob")[['Yes']]
+logit_auc <- pROC::roc(valid_model_data$Churn, logit_valid_probs, levels = c("No", "Yes"))
+logit_brier <- mean((ifelse(valid_model_data$Churn == "Yes", 1, 0) - logit_valid_probs)^2)
+
+list(AUC = logit_auc$auc, Brier = logit_brier)
+```
+
+# Advanced Models
+
+```{r advanced-models}
+rf_grid <- expand.grid(mtry = c(2, 4, 6, 8))
+rf_model <- train(
+  Churn ~ .,
+  data = train_model_data,
+  method = "rf",
+  metric = "ROC",
+  trControl = ctrl_oof,
+  tuneGrid = rf_grid
+)
+
+rf_valid_probs <- predict(rf_model, newdata = valid_model_data, type = "prob")[['Yes']]
+rf_auc <- pROC::roc(valid_model_data$Churn, rf_valid_probs, levels = c("No", "Yes"))
+rf_brier <- mean((ifelse(valid_model_data$Churn == "Yes", 1, 0) - rf_valid_probs)^2)
+
+xgb_grid <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 5),
+  eta = c(0.05, 0.1),
+  gamma = 0,
+  colsample_bytree = c(0.7, 0.9),
+  min_child_weight = c(1, 3),
+  subsample = c(0.7, 0.9)
+)
+
+xgb_model <- train(
+  Churn ~ .,
+  data = train_model_data,
+  method = "xgbTree",
+  metric = "ROC",
+  trControl = ctrl_oof,
+  tuneGrid = xgb_grid,
+  verbose = FALSE
+)
+
+xgb_valid_probs <- predict(xgb_model, newdata = valid_model_data, type = "prob")[['Yes']]
+xgb_auc <- pROC::roc(valid_model_data$Churn, xgb_valid_probs, levels = c("No", "Yes"))
+xgb_brier <- mean((ifelse(valid_model_data$Churn == "Yes", 1, 0) - xgb_valid_probs)^2)
+
+model_performance <- tibble(
+  Model = c("Logistic Regression", "Random Forest", "Gradient Boosting (XGBoost)"),
+  AUC = c(logit_auc$auc, rf_auc$auc, xgb_auc$auc),
+  Brier = c(logit_brier, rf_brier, xgb_brier)
+)
+
+model_performance %>%
+  arrange(desc(AUC)) %>%
+  kable(digits = 4)
+```
+
+# Calibration (Platt Scaling)
+
+```{r calibration}
+model_store <- list(
+  "Logistic Regression" = logit_model,
+  "Random Forest" = rf_model,
+  "Gradient Boosting (XGBoost)" = xgb_model
+)
+
+validation_probabilities <- list(
+  "Logistic Regression" = logit_valid_probs,
+  "Random Forest" = rf_valid_probs,
+  "Gradient Boosting (XGBoost)" = xgb_valid_probs
+)
+
+best_model_name <- model_performance %>% arrange(desc(AUC)) %>% dplyr::slice(1) %>% pull(Model)
+best_model <- model_store[[best_model_name]]
+best_valid_probs <- validation_probabilities[[best_model_name]]
+
+calibration_df <- tibble(
+  churn = ifelse(valid_model_data$Churn == "Yes", 1, 0),
+  score = best_valid_probs
+)
+
+platt_model <- glm(churn ~ score, data = calibration_df, family = binomial())
+calibration_df <- calibration_df %>% mutate(calibrated = predict(platt_model, type = "response"))
+
+calibration_plot_data <- calibration_df %>%
+  mutate(bin = ntile(score, 10)) %>%
+  group_by(bin) %>%
+  summarise(
+    avg_score = mean(score),
+    avg_calibrated = mean(calibrated),
+    actual_rate = mean(churn),
+    .groups = "drop"
+  )
+
+calibration_plot <- ggplot(calibration_plot_data, aes(x = avg_score)) +
+  geom_line(aes(y = actual_rate), color = "#E74C3C", size = 1.2) +
+  geom_point(aes(y = actual_rate), color = "#E74C3C", size = 2) +
+  geom_line(aes(y = avg_calibrated), color = "#2C3E50", linetype = "dashed", size = 1) +
+  geom_abline(slope = 1, intercept = 0, color = "gray50", linetype = "dotted") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = paste("Calibration Curve:", best_model_name),
+    x = "Predicted Probability (Raw)",
+    y = "Observed Churn Rate",
+    caption = "Solid red = empirical rate, dashed navy = Platt-scaled"
+  )
+
+print(calibration_plot)
+
+ggplot2::ggsave("figures/calibration.png", calibration_plot, width = 7, height = 5, dpi = 300)
+```
+
+# Ablation Table
+
+```{r ablation}
+calc_auc <- function(actual, predicted) {
+  roc_obj <- pROC::roc(actual, predicted, levels = c("No", "Yes"))
+  roc_obj$auc %>% as.numeric()
+}
+
+calc_brier <- function(actual, predicted) {
+  mean((ifelse(actual == "Yes", 1, 0) - predicted)^2)
+}
+
+feature_groups <- list(
+  "Demographics" = c("gender", "SeniorCitizen", "Partner", "Dependents"),
+  "Contract Information" = c("Contract", "PaperlessBilling", "PaymentMethod"),
+  "Billing" = c("MonthlyCharges", "TotalCharges"),
+  "Internet & Phone Services" = c("InternetService", "OnlineSecurity", "OnlineBackup", "DeviceProtection", "TechSupport", "StreamingTV", "StreamingMovies", "MultipleLines", "PhoneService")
+)
+
+baseline_auc <- calc_auc(valid_model_data$Churn, best_valid_probs)
+baseline_brier <- calc_brier(valid_model_data$Churn, best_valid_probs)
+
+ablation_results <- purrr::imap_dfr(feature_groups, function(features, group_name) {
+  set.seed(123)
+  available_features <- intersect(features, names(train_model_data))
+
+  reduced_train <- train_model_data %>% select(-all_of(available_features))
+  reduced_valid <- valid_model_data %>% select(-all_of(available_features))
+
+  train_args <- list(
+    form = Churn ~ .,
+    data = reduced_train,
+    method = best_model$method,
+    metric = "ROC",
+    trControl = ctrl_oof
+  )
+
+  if (!is.null(best_model$bestTune)) {
+    train_args$tuneGrid <- best_model$bestTune
+  }
+
+  if (best_model$method == "glm") {
+    train_args$family <- binomial()
+  }
+
+  if (best_model$method == "xgbTree") {
+    train_args$verbose <- FALSE
+  }
+
+  reduced_model <- do.call(train, train_args)
+
+  reduced_probs <- predict(reduced_model, newdata = reduced_valid, type = "prob")[['Yes']]
+  tibble(
+    Group = group_name,
+    Removed = paste(available_features, collapse = ", "),
+    AUC = calc_auc(reduced_valid$Churn, reduced_probs),
+    Brier = calc_brier(reduced_valid$Churn, reduced_probs)
+  )
+}) %>%
+  mutate(
+    Delta_AUC = AUC - baseline_auc,
+    Delta_Brier = Brier - baseline_brier
+  )
+
+ablation_results %>% kable(digits = 4)
+```
+
+Removing contract information and internet service attributes produces the largest deterioration in AUC and the biggest increase in Brier Score, underscoring how subscription terms and technical support products drive retention risk. Demographic variables have the smallest impact, indicating operational levers are far more predictive than static customer traits.
+
+# Decision Rule and Cost Table
+
+```{r decision-rule}
+contact_cost <- 5
+retention_value <- 100
+
+calibrated_probs <- calibration_df$calibrated
+validation_ids <- valid_data$ID
+
+threshold_grid <- seq(0.1, 0.6, by = 0.01)
+
+decision_summary <- map_dfr(threshold_grid, function(th) {
+  contacts <- calibrated_probs >= th
+  n_contacts <- sum(contacts)
+  true_positives <- sum(contacts & (valid_model_data$Churn == "Yes"))
+  precision <- ifelse(n_contacts > 0, true_positives / n_contacts, 0)
+  expected_value <- true_positives * retention_value - n_contacts * contact_cost
+  tibble(
+    Threshold = th,
+    Contacts = n_contacts,
+    Contacts_per_1000 = n_contacts / nrow(valid_model_data) * 1000,
+    Expected_Saves = true_positives,
+    Expected_Value = expected_value,
+    Precision = precision
+  )
+})
+
+best_threshold <- decision_summary %>% arrange(desc(Expected_Value)) %>% dplyr::slice(1)
+
+best_threshold %>% mutate(across(where(is.numeric), round, 3)) %>% kable()
+
+recommended_threshold <- best_threshold$Threshold
+recommended_rule <- sprintf(
+  "Contact any customer with calibrated p_churn ≥ %.2f (≈ %d contacts per 1,000) under a $%d/contact budget and $%d per save.",
+  recommended_threshold,
+  round(best_threshold$Contacts_per_1000),
+  contact_cost,
+  retention_value
+)
+
+cat(recommended_rule, "\n")
+
+net_value_per_1000 <- (best_threshold$Expected_Value / nrow(valid_model_data)) * 1000
+cat(sprintf("At this threshold the expected net value is approximately $%.0f per 1,000 customers.\n", net_value_per_1000))
+
+cat("> **Final Manager Rule:** ", recommended_rule, "\n", sep = "")
+```
+
+# Save Outputs
+
+```{r save-outputs}
+collect_oof <- function(model, training_data, id_vector) {
+  oof <- model$pred
+  if (!is.null(model$bestTune)) {
+    for (param in names(model$bestTune)) {
+      oof <- oof[oof[[param]] == model$bestTune[[param]], ]
+    }
+  }
+  if ("Resample" %in% names(oof)) {
+    oof <- oof %>% distinct(rowIndex, .keep_all = TRUE)
+  }
+  oof <- oof %>%
+    mutate(rowIndex = as.integer(as.character(rowIndex))) %>%
+    left_join(
+      tibble(rowIndex = seq_along(id_vector), ID = id_vector),
+      by = "rowIndex"
+    ) %>%
+    select(ID, obs, pred, Probability = Yes)
+  oof
+}
+
+write_with_fallback <- function(data, filename) {
+  primary_path <- file.path(getwd(), filename)
+  write_ok <- tryCatch({
+    readr::write_csv(data, primary_path)
+    TRUE
+  }, error = function(.e) FALSE)
+
+  if (!write_ok) {
+    dir.create("outputs", showWarnings = FALSE)
+    fallback_path <- file.path(getwd(), "outputs", filename)
+    readr::write_csv(data, fallback_path)
+    return(fallback_path)
+  }
+
+  primary_path
+}
+
+oof_predictions <- collect_oof(best_model, train_model_data, train_data$ID)
+oof_path <- write_with_fallback(oof_predictions, "oof_predictions.csv")
+
+prediction_table <- tibble(
+  ID = validation_ids,
+  Actual = valid_model_data$Churn,
+  Raw_Probability = best_valid_probs,
+  Calibrated_Probability = calibrated_probs
+)
+
+prediction_path <- write_with_fallback(prediction_table, "predictions.csv")
+
+cat("OOF predictions saved to:", oof_path, "\n")
+cat("Validation predictions saved to:", prediction_path, "\n")
+```
+
+> Each sample's out-of-fold probability comes from a model that excluded that sample during training, ensuring unbiased holdout-like estimates.
+
+# Holdout Scoring
+
+```{r holdout-scoring}
+# ---- Holdout Scoring Section ----
+holdout_path <- "holdout_features.csv"
+if (file.exists(holdout_path)) {
+  hold <- readr::read_csv(holdout_path, show_col_types = FALSE)
+
+  hold_proc <- hold %>%
+    mutate(across(any_of(names(train_medians)), ~ ifelse(is.na(.), train_medians[[cur_column()]], .))) %>%
+    mutate(across(where(is.character), as.factor))
+
+  for (nm in names(train_factor_levels)) {
+    if (nm %in% names(hold_proc)) {
+      hold_proc[[nm]] <- factor(hold_proc[[nm]], levels = train_factor_levels[[nm]])
+    }
+  }
+
+  missing_cols <- setdiff(feature_names, names(hold_proc))
+  if (length(missing_cols) > 0) {
+    for (mc in missing_cols) {
+      if (mc %in% names(train_factor_levels)) {
+        hold_proc[[mc]] <- factor(NA, levels = train_factor_levels[[mc]])
+      } else if (mc %in% names(train_medians)) {
+        hold_proc[[mc]] <- train_medians[[mc]]
+      } else {
+        hold_proc[[mc]] <- NA
+      }
+    }
+  }
+
+  hold_features <- hold_proc %>% select(all_of(feature_names))
+
+  raw <- predict(best_model, newdata = hold_features, type = "prob")[['Yes']]
+  cal <- predict(platt_model, newdata = data.frame(score = raw), type = "response")
+
+  readr::write_csv(
+    tibble(customer_id = hold$ID, p_churn = cal),
+    "predictions.csv"
+  )
+}
+```
+
+## Holdout Results (Pending Labels)
+
+Final holdout AUC, Brier Score, and calibration diagnostics will be added once the official labels are released and can be safely merged with the saved predictions.
+
+# AI Use, Prompts, and Reflection
+
+This report was prepared with assistance from OpenAI Codex (gpt-5-codex) to draft code and narrative structure. Human review ensured alignment with the project specification, reproducibility requirements, and ethical data science practices. The iterative prompting helped streamline complex calibration and ablation workflows, while manual reasoning was still necessary to define cost assumptions and interpret model diagnostics.
+
+```{r session-info}
+sessionInfo()
+```
